@@ -1,0 +1,77 @@
+#' Build the ball-level analysis frame for player-effect DML.
+#'
+#' Outcome: runs off the bat on a delivery.
+#' Treatment design: batter indicators (reference = most common batter).
+#' Controls: context + bowler (not batter).
+#'
+#' @param deliveries data.table/data.frame of ball-by-ball rows.
+#' @param min_balls Drop batters with fewer than this many balls faced.
+#' @return list with `frame`, `y`, `D` (sparse Matrix), `X` (sparse Matrix),
+#'   `batter_levels`, `reference_batter`, `feature_info`.
+prepare_player_dml_frame <- function(deliveries, min_balls = 80L) {
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Install data.table", call. = FALSE)
+  }
+  if (!requireNamespace("Matrix", quietly = TRUE)) {
+    stop("Install Matrix", call. = FALSE)
+  }
+
+  dt <- data.table::as.data.table(deliveries)
+  # Keep batting events with a striker (all rows are strikes in our generator)
+  dt <- dt[!is.na(batter_id) & !is.na(runs_off_bat)]
+
+  ball_n <- dt[, .N, by = batter_id]
+  keep <- ball_n[N >= as.integer(min_balls)]$batter_id
+  dt <- dt[batter_id %in% keep]
+
+  # Reference: most balls faced (stable baseline)
+  ref <- ball_n[batter_id %in% keep][which.max(N)]$batter_id
+
+  dt[, `:=`(
+    series_league = factor(series_league),
+    venue = factor(venue),
+    season = factor(season),
+    phase = factor(phase, levels = c("powerplay", "middle", "death")),
+    innings = factor(innings),
+    bowler_id = factor(bowler_id),
+    day_night = as.integer(day_night),
+    batter_is_home = as.integer(batter_is_home),
+    over_z = as.numeric(scale(over)),
+    batting_position_z = as.numeric(scale(batting_position))
+  )]
+
+  y <- as.numeric(dt$runs_off_bat)
+
+  # Treatment matrix: batter dummies excluding reference
+  batter_fac <- factor(dt$batter_id)
+  batter_levels <- setdiff(levels(batter_fac), ref)
+  D <- Matrix::sparse.model.matrix(~ 0 + batter_id, data = dt)
+  keep_cols <- setdiff(colnames(D), paste0("batter_id", ref))
+  # colnames are batter_idBatter_001 style
+  ref_col <- paste0("batter_id", ref)
+  D <- D[, setdiff(colnames(D), ref_col), drop = FALSE]
+  colnames(D) <- sub("^batter_id", "", colnames(D))
+
+  # Controls: everything that confounds batter assignment / scoring except batter
+  X <- Matrix::sparse.model.matrix(
+    ~ 0 + series_league + venue + season + phase + innings +
+      bowler_id + day_night + batter_is_home + over_z + batting_position_z,
+    data = dt
+  )
+
+  list(
+    frame = dt,
+    y = y,
+    D = D,
+    X = X,
+    batter_levels = colnames(D),
+    reference_batter = ref,
+    feature_info = list(
+      n_obs = length(y),
+      n_batters = ncol(D),
+      n_controls = ncol(X),
+      min_balls = as.integer(min_balls),
+      mean_y = mean(y)
+    )
+  )
+}
