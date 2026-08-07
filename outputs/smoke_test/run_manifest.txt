@@ -1,0 +1,12 @@
+generated_at: 2026-08-07 13:27:37
+root: /Users/ieuanisrael/Documents/cricket-dml-runs
+n_matches: 60
+n_deliveries: 6865
+min_balls: 60
+n_folds: 3
+seed: 42
+reference_batter: Batter_035
+rmse_vs_truth: 0.21732
+mae_vs_truth: 0.18344
+corr_vs_truth: 0.77404
+estimates: outputs/smoke_test/player_effects_dml.csv

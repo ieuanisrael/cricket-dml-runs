@@ -6,10 +6,8 @@
 .DS_Store
 data/raw/*
 data/processed/*
-outputs/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
-!outputs/.gitkeep
 renv/library/
 renv/local/
 renv/cellar/
