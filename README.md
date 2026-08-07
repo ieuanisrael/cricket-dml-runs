@@ -1,6 +1,6 @@
 # cricket-dml-runs
 
-Double / debiased machine learning (**DML**) for **T20 batter run effects**, with synthetic ball-by-ball data (known ground truth for validation).
+Double / debiased machine learning (**DML**) for **T20 batter run effects**, with synthetic ball-by-ball data and a **RAE vs DML** benchmark.
 
 ## What this estimates
 
@@ -49,15 +49,16 @@ Rscript R/run_all.R --matches=80 --min-balls=80 --folds=5 --seed=42 --out=output
 
 | Step | Script | Output |
 |------|--------|--------|
-| 1. Simulate T20 BBB | `R/generate_synthetic_bbb.R` | `data/raw/t20_ball_by_ball.csv`, `data/processed/true_effects.rds` |
+| 1. Simulate T20 BBB | `R/generate_synthetic_bbb.R` | `data/raw/t20_ball_by_ball.csv` |
 | 2. Analysis frame | `R/prepare_analysis_frame.R` | Batter \(D\), controls \(X\), outcome \(Y\) |
-| 3. DML | `R/estimate_player_dml.R` | `player_effects_dml.csv`, forest plot, truth comparison |
+| 3. DML | `R/estimate_player_dml.R` | `player_effects_dml.csv`, forest plot |
+| 4. RAE vs DML | `R/compare_rae_dml.R` | `player_effects_rae.csv`, `rae_vs_dml.csv`, comparison plots |
+
+**RAE** here is mean ball-level residual from a cross-fitted \(E[Y\mid X]\) model (same controls as DML, no batter), contrasted vs the reference batter. It is a simple benchmark, not ground truth.
 
 ## Synthetic data fields
 
 Ball-level columns include: `match_id`, `series_league`, `season`, `venue`, `day_night`, `innings`, `over`, `ball_in_over`, `phase`, `batting_team`, `bowling_team`, `batter_id`, `non_striker_id`, `batting_position`, `bowler_id`, `batter_is_home`, `runs_off_bat`, `extras`, `is_wicket`, `target` (2nd innings), and cumulative score/wickets.
-
-True batter / bowler / venue / phase effects are saved for recovery checks (`corr_vs_truth` in the run manifest).
 
 ## Project layout
 

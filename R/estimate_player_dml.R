@@ -140,33 +140,13 @@ estimate_player_effects_dml <- function(
   )
 }
 
-#' Merge DML estimates with known true batter effects (simulation only).
-evaluate_against_truth <- function(estimates, true_effects) {
-  truth <- true_effects$batter
-  ref <- unique(estimates$reference_batter)
-  # True contrast vs reference
-  true_contrast <- truth[estimates$batter_id] - truth[[ref]]
-  out <- data.table::copy(estimates)
-  out[, true_effect := as.numeric(true_contrast)]
-  out[, error := effect_runs_per_ball - true_effect]
-  list(
-    table = out,
-    rmse = sqrt(mean(out$error^2)),
-    mae = mean(abs(out$error)),
-    corr = stats::cor(out$effect_runs_per_ball, out$true_effect)
-  )
-}
-
-#' Forest plot of estimated player effects (optional truth overlay).
-plot_player_effects <- function(estimates, truth_eval = NULL, out_path = NULL, top_n = 30L) {
+#' Forest plot of estimated player effects.
+plot_player_effects <- function(estimates, out_path = NULL, top_n = 30L) {
   if (!requireNamespace("ggplot2", quietly = TRUE)) {
     warning("ggplot2 not installed; skipping plot")
     return(invisible(NULL))
   }
   dt <- data.table::copy(estimates)
-  if (!is.null(truth_eval)) {
-    dt <- truth_eval$table
-  }
   dt <- utils::head(dt, as.integer(top_n))
   dt[, batter_id := factor(batter_id, levels = rev(batter_id))]
 
@@ -183,15 +163,6 @@ plot_player_effects <- function(estimates, truth_eval = NULL, out_path = NULL, t
       y = NULL
     ) +
     ggplot2::theme_minimal(base_size = 12)
-
-  if (!is.null(truth_eval) && "true_effect" %in% names(dt)) {
-    p <- p + ggplot2::geom_point(
-      ggplot2::aes(x = true_effect),
-      colour = "#b45309",
-      shape = 18,
-      size = 2.5
-    )
-  }
 
   if (!is.null(out_path)) {
     dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)

@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-#' End-to-end: synthetic T20 BBB -> DML batter effects -> validation plots.
+#' End-to-end: synthetic T20 BBB -> DML batter effects -> RAE vs DML.
 
 root <- Sys.getenv("CRICKET_DML_ROOT", unset = "")
 if (!nzchar(root)) {
@@ -17,6 +17,7 @@ setwd(root)
 source(file.path(root, "R/generate_synthetic_bbb.R"))
 source(file.path(root, "R/prepare_analysis_frame.R"))
 source(file.path(root, "R/estimate_player_dml.R"))
+source(file.path(root, "R/compare_rae_dml.R"))
 
 args <- commandArgs(trailingOnly = TRUE)
 parse_flag <- function(flag, default) {
@@ -64,16 +65,21 @@ fit <- estimate_player_effects_dml(
 est_path <- file.path(out_dir, "player_effects_dml.csv")
 data.table::fwrite(fit$estimates, est_path)
 
-message("==> Evaluating against ground-truth batter effects")
-ev <- evaluate_against_truth(fit$estimates, sim$true_effects)
-data.table::fwrite(ev$table, file.path(out_dir, "player_effects_vs_truth.csv"))
-
 plot_player_effects(
   fit$estimates,
-  truth_eval = ev,
   out_path = file.path(out_dir, "plots/player_effects_forest.png"),
   top_n = 30L
 )
+
+message("==> Estimating context-only RAE by batter")
+rae <- estimate_player_rae(prepared, n_folds = n_folds, seed = seed)
+data.table::fwrite(rae$estimates, file.path(out_dir, "player_effects_rae.csv"))
+
+message("==> Comparing RAE vs DML")
+cmp <- compare_rae_vs_dml(fit$estimates, rae$estimates)
+data.table::fwrite(cmp$table, file.path(out_dir, "rae_vs_dml.csv"))
+plot_rae_vs_dml(cmp, out_path = file.path(out_dir, "plots/rae_vs_dml_scatter.png"))
+plot_rae_dml_forest(cmp, out_path = file.path(out_dir, "plots/rae_vs_dml_forest.png"), top_n = 30L)
 
 manifest <- c(
   paste0("generated_at: ", Sys.time()),
@@ -84,14 +90,17 @@ manifest <- c(
   paste0("n_folds: ", n_folds),
   paste0("seed: ", seed),
   paste0("reference_batter: ", prepared$reference_batter),
-  paste0("rmse_vs_truth: ", round(ev$rmse, 5)),
-  paste0("mae_vs_truth: ", round(ev$mae, 5)),
-  paste0("corr_vs_truth: ", round(ev$corr, 5)),
-  paste0("estimates: ", est_path)
+  paste0("rae_dml_pearson: ", round(cmp$corr, 5)),
+  paste0("rae_dml_spearman: ", round(cmp$spearman, 5)),
+  paste0("rae_dml_rmse: ", round(cmp$rmse, 5)),
+  paste0("rae_dml_mae: ", round(cmp$mae, 5)),
+  paste0("estimates_dml: ", est_path),
+  paste0("estimates_rae: ", file.path(out_dir, "player_effects_rae.csv")),
+  paste0("comparison: ", file.path(out_dir, "rae_vs_dml.csv"))
 )
 writeLines(manifest, file.path(out_dir, "run_manifest.txt"))
 
 message("==> Done")
-message("    RMSE vs truth: ", round(ev$rmse, 4))
-message("    Corr vs truth: ", round(ev$corr, 4))
+message("    RAE vs DML Pearson:  ", round(cmp$corr, 4))
+message("    RAE vs DML Spearman: ", round(cmp$spearman, 4))
 message("    Outputs: ", normalizePath(out_dir))
