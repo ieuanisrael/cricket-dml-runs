@@ -41,16 +41,16 @@ estimate_player_rae <- function(prepared, n_folds = 5L, seed = 42L) {
 
   rae_ball <- y - y_hat
   dt <- data.table::data.table(
-    batter_id = prepared$frame$batter_id,
+    striker_id = prepared$frame$striker_id,
     rae = rae_ball
   )
   by_batter <- dt[, .(
     balls_faced = .N,
     rae_mean = mean(rae),
     rae_se = stats::sd(rae) / sqrt(.N)
-  ), by = batter_id]
+  ), by = striker_id]
 
-  ref_rae <- by_batter[batter_id == ref]$rae_mean
+  ref_rae <- by_batter[striker_id == ref]$rae_mean
   if (!length(ref_rae)) {
     stop("Reference batter not found in RAE table: ", ref, call. = FALSE)
   }
@@ -62,7 +62,7 @@ estimate_player_rae <- function(prepared, n_folds = 5L, seed = 42L) {
     ci_hi = rae_mean - ref_rae + 1.96 * rae_se
   )]
   # Drop reference row from contrast table (effect is definitionally 0)
-  estimates <- by_batter[batter_id != ref]
+  estimates <- by_batter[striker_id != ref]
   data.table::setorder(estimates, -rae_vs_ref)
 
   list(
@@ -89,7 +89,7 @@ compare_rae_vs_dml <- function(dml_estimates, rae_estimates) {
   }
 
   dml <- data.table::as.data.table(dml_estimates)[, .(
-    batter_id,
+    striker_id,
     balls_faced,
     dml_effect = effect_runs_per_ball,
     dml_se = se,
@@ -98,7 +98,7 @@ compare_rae_vs_dml <- function(dml_estimates, rae_estimates) {
     reference_batter
   )]
   rae <- data.table::as.data.table(rae_estimates)[, .(
-    batter_id,
+    striker_id,
     rae_vs_ref,
     rae_mean,
     rae_se,
@@ -106,7 +106,7 @@ compare_rae_vs_dml <- function(dml_estimates, rae_estimates) {
     rae_ci_hi = ci_hi
   )]
 
-  tab <- merge(dml, rae, by = "batter_id", all = FALSE)
+  tab <- merge(dml, rae, by = "striker_id", all = FALSE)
   tab[, `:=`(
     diff_dml_minus_rae = dml_effect - rae_vs_ref,
     abs_diff = abs(dml_effect - rae_vs_ref)
@@ -167,13 +167,13 @@ plot_rae_dml_forest <- function(comparison, out_path = NULL, top_n = 30L) {
   }
   dt <- utils::head(comparison$table, as.integer(top_n))
   long <- data.table::rbindlist(list(
-    dt[, .(batter_id, method = "DML", effect = dml_effect, lo = dml_ci_lo, hi = dml_ci_hi)],
-    dt[, .(batter_id, method = "RAE", effect = rae_vs_ref, lo = rae_ci_lo, hi = rae_ci_hi)]
+    dt[, .(striker_id, method = "DML", effect = dml_effect, lo = dml_ci_lo, hi = dml_ci_hi)],
+    dt[, .(striker_id, method = "RAE", effect = rae_vs_ref, lo = rae_ci_lo, hi = rae_ci_hi)]
   ))
-  long[, batter_id := factor(batter_id, levels = rev(dt$batter_id))]
+  long[, striker_id := factor(striker_id, levels = rev(dt$striker_id))]
   long[, method := factor(method, levels = c("DML", "RAE"))]
 
-  p <- ggplot2::ggplot(long, ggplot2::aes(x = effect, y = batter_id, colour = method)) +
+  p <- ggplot2::ggplot(long, ggplot2::aes(x = effect, y = striker_id, colour = method)) +
     ggplot2::geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
     ggplot2::geom_pointrange(
       ggplot2::aes(xmin = lo, xmax = hi),

@@ -68,7 +68,7 @@ generate_synthetic_t20_bbb <- function(
 
     match_meta[[m]] <- data.table::data.table(
       match_id = match_id,
-      series_league = league,
+      series = league,
       venue = venue,
       season = season,
       day_night = day_night,
@@ -134,7 +134,7 @@ generate_synthetic_t20_bbb <- function(
         is_wicket <- stats::runif(1) < p_wkt
 
         if (is_wicket) {
-          runs_off_bat <- 0L
+          bat_score <- 0L
           extras <- 0L
           how_out <- sample(c("caught", "bowled", "lbw", "run_out"), 1L, prob = c(0.55, 0.25, 0.12, 0.08))
           wickets <- wickets + 1L
@@ -142,16 +142,16 @@ generate_synthetic_t20_bbb <- function(
           how_out <- NA_character_
           # multinomial-ish runs: 0,1,2,3,4,6 with mean ~ mu
           probs <- .runs_probs(mu)
-          runs_off_bat <- sample(c(0L, 1L, 2L, 3L, 4L, 6L), 1L, prob = probs)
+          bat_score <- sample(c(0L, 1L, 2L, 3L, 4L, 6L), 1L, prob = probs)
           extras <- if (stats::runif(1) < 0.04) sample(c(1L, 1L, 1L, 5L), 1L) else 0L
         }
 
-        total_runs <- runs_off_bat + extras
+        total_runs <- bat_score + extras
         innings_runs <- innings_runs + total_runs
 
         rows[[length(rows) + 1L]] <- data.table::data.table(
           match_id = match_id,
-          series_league = league,
+          series = league,
           season = season,
           venue = venue,
           day_night = day_night,
@@ -163,12 +163,12 @@ generate_synthetic_t20_bbb <- function(
           phase = phase,
           batting_team = batting_team,
           bowling_team = bowling_team,
-          batter_id = batter,
+          striker_id = batter,
           non_striker_id = non_striker,
-          batting_position = as.integer(striker_pos),
+          striker_batting_position = as.integer(striker_pos),
           bowler_id = current_bowler,
           batter_is_home = batter_is_home,
-          runs_off_bat = as.integer(runs_off_bat),
+          bat_score = as.integer(bat_score),
           extras = as.integer(extras),
           total_runs = as.integer(total_runs),
           is_wicket = is_wicket,
@@ -179,7 +179,7 @@ generate_synthetic_t20_bbb <- function(
         )
 
         # strike rotation
-        if (!is_wicket && runs_off_bat %% 2L == 1L) {
+        if (!is_wicket && bat_score %% 2L == 1L) {
           tmp <- striker_pos
           striker_pos <- non_pos
           non_pos <- tmp

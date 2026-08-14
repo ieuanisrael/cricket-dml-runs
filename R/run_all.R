@@ -18,6 +18,7 @@ source(file.path(root, "R/generate_synthetic_bbb.R"))
 source(file.path(root, "R/prepare_analysis_frame.R"))
 source(file.path(root, "R/estimate_player_dml.R"))
 source(file.path(root, "R/compare_rae_dml.R"))
+source(file.path(root, "R/elo_ratings.R"))
 
 args <- commandArgs(trailingOnly = TRUE)
 parse_flag <- function(flag, default) {
@@ -81,6 +82,27 @@ data.table::fwrite(cmp$table, file.path(out_dir, "rae_vs_dml.csv"))
 plot_rae_vs_dml(cmp, out_path = file.path(out_dir, "plots/rae_vs_dml_scatter.png"))
 plot_rae_dml_forest(cmp, out_path = file.path(out_dir, "plots/rae_vs_dml_forest.png"), top_n = 30L)
 
+message("==> Computing delivery-level Elo (striker & bowler skill proxy)")
+elo <- compute_elo_ratings(sim$deliveries, k = 8, base = 1500, scale = 400)
+data.table::fwrite(elo$striker, file.path(out_dir, "elo_striker.csv"))
+data.table::fwrite(elo$bowler, file.path(out_dir, "elo_bowler.csv"))
+elo_bat <- batter_elo_vs_ref(
+  elo$striker,
+  reference_batter = prepared$reference_batter,
+  min_balls = min_balls
+)
+data.table::fwrite(elo_bat, file.path(out_dir, "elo_striker_vs_ref.csv"))
+
+message("==> Comparing Elo vs DML")
+elo_cmp <- compare_elo_vs_dml(fit$estimates, elo_bat)
+data.table::fwrite(elo_cmp$table, file.path(out_dir, "elo_vs_dml.csv"))
+plot_elo_vs_dml(elo_cmp, out_path = file.path(out_dir, "plots/elo_vs_dml_scatter.png"))
+plot_elo_on_dml_forest(
+  elo_cmp,
+  out_path = file.path(out_dir, "plots/player_effects_forest_elo.png"),
+  top_n = 30L
+)
+
 manifest <- c(
   paste0("generated_at: ", Sys.time()),
   paste0("root: ", root),
@@ -94,13 +116,20 @@ manifest <- c(
   paste0("rae_dml_spearman: ", round(cmp$spearman, 5)),
   paste0("rae_dml_rmse: ", round(cmp$rmse, 5)),
   paste0("rae_dml_mae: ", round(cmp$mae, 5)),
+  paste0("elo_k: ", elo$meta$k),
+  paste0("elo_dml_pearson: ", round(elo_cmp$corr, 5)),
+  paste0("elo_dml_spearman: ", round(elo_cmp$spearman, 5)),
   paste0("estimates_dml: ", est_path),
   paste0("estimates_rae: ", file.path(out_dir, "player_effects_rae.csv")),
-  paste0("comparison: ", file.path(out_dir, "rae_vs_dml.csv"))
+  paste0("elo_striker: ", file.path(out_dir, "elo_striker.csv")),
+  paste0("elo_bowler: ", file.path(out_dir, "elo_bowler.csv")),
+  paste0("comparison_rae: ", file.path(out_dir, "rae_vs_dml.csv")),
+  paste0("comparison_elo: ", file.path(out_dir, "elo_vs_dml.csv"))
 )
 writeLines(manifest, file.path(out_dir, "run_manifest.txt"))
 
 message("==> Done")
 message("    RAE vs DML Pearson:  ", round(cmp$corr, 4))
-message("    RAE vs DML Spearman: ", round(cmp$spearman, 4))
+message("    Elo vs DML Pearson:  ", round(elo_cmp$corr, 4))
+message("    Elo vs DML Spearman: ", round(elo_cmp$spearman, 4))
 message("    Outputs: ", normalizePath(out_dir))

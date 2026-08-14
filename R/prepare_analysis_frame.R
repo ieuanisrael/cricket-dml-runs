@@ -1,11 +1,11 @@
 #' Build the ball-level analysis frame for player-effect DML.
 #'
-#' Outcome: runs off the bat on a delivery.
-#' Treatment design: batter indicators (reference = most common batter).
-#' Controls: context + bowler (not batter).
+#' Outcome: `bat_score` on a delivery.
+#' Treatment design: striker indicators (reference = most common striker).
+#' Controls: context + bowler (not striker).
 #'
 #' @param deliveries data.table/data.frame of ball-by-ball rows.
-#' @param min_balls Drop batters with fewer than this many balls faced.
+#' @param min_balls Drop strikers with fewer than this many balls faced.
 #' @return list with `frame`, `y`, `D` (sparse Matrix), `X` (sparse Matrix),
 #'   `batter_levels`, `reference_batter`, `feature_info`.
 prepare_player_dml_frame <- function(deliveries, min_balls = 80L) {

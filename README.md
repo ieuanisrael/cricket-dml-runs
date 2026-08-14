@@ -10,10 +10,10 @@ Partially linear model on each delivery:
 Y = D\theta + g(X) + \varepsilon
 \]
 
-- **\(Y\)**: runs off the bat
-- **\(D\)**: batter indicators (vs a reference batter)
-- **\(X\)**: series/league, venue, season, innings, phase, bowler, home, over, batting position, day/night
-- **\(\theta\)**: debiased batter effects (runs per ball), after cross-fitting out \(g(X)\) and \(E[D\mid X]\)
+- **\(Y\)**: `bat_score` (runs off the bat)
+- **\(D\)**: striker indicators (vs a reference striker)
+- **\(X\)**: venue, phase, bowler, home, over, batting position (plus optional series/season/innings/day-night when enabled)
+- **\(\theta\)**: debiased striker effects (runs per ball), after cross-fitting out \(g(X)\) and \(E[D\mid X]\)
 
 Cluster-robust SEs use **match_id**. Multiple testing across batters uses BH–FDR.
 
@@ -53,12 +53,17 @@ Rscript R/run_all.R --matches=80 --min-balls=80 --folds=5 --seed=42 --out=output
 | 2. Analysis frame | `R/prepare_analysis_frame.R` | Batter \(D\), controls \(X\), outcome \(Y\) |
 | 3. DML | `R/estimate_player_dml.R` | `player_effects_dml.csv`, forest plot |
 | 4. RAE vs DML | `R/compare_rae_dml.R` | `player_effects_rae.csv`, `rae_vs_dml.csv`, comparison plots |
+| 5. Elo skill proxy | `R/elo_ratings.R` | `elo_striker.csv`, `elo_bowler.csv`, Elo vs DML plots |
 
-**RAE** here is mean ball-level residual from a cross-fitted \(E[Y\mid X]\) model (same controls as DML, no batter), contrasted vs the reference batter. It is a simple benchmark, not ground truth.
+**RAE** here is mean ball-level residual from a cross-fitted \(E[Y\mid X]\) model (same controls as DML, no striker), contrasted vs the reference striker. It is a simple benchmark, not ground truth.
+
+**Elo** is a delivery-level striker–bowler rating (K=8, base 1500). It is an outcome-derived skill **proxy**, not independent truth.
 
 ## Synthetic data fields
 
-Ball-level columns include: `match_id`, `series_league`, `season`, `venue`, `day_night`, `innings`, `over`, `ball_in_over`, `phase`, `batting_team`, `bowling_team`, `batter_id`, `non_striker_id`, `batting_position`, `bowler_id`, `batter_is_home`, `runs_off_bat`, `extras`, `is_wicket`, `target` (2nd innings), and cumulative score/wickets.
+Ball-level columns include: `match_id`, `series`, `season`, `venue`, `day_night`, `innings`, `over`, `ball_in_over`, `phase`, `batting_team`, `bowling_team`, `striker_id`, `non_striker_id`, `striker_batting_position`, `bowler_id`, `batter_is_home`, `bat_score`, `extras`, `is_wicket`, `target` (2nd innings), and cumulative score/wickets.
+
+Column names follow the internal BBB schema (`striker_id`, `bat_score`, `striker_batting_position`, etc.).
 
 ## Project layout
 
