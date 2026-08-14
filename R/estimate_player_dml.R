@@ -110,7 +110,7 @@ estimate_player_effects_dml <- function(
   fdr <- stats::p.adjust(pval, method = "BH")
 
   est <- data.table::data.table(
-    batter_id = names(theta),
+    striker_id = names(theta),
     effect_runs_per_ball = as.numeric(theta),
     se = as.numeric(se),
     ci_lo = as.numeric(theta - 1.96 * se),
@@ -121,9 +121,9 @@ estimate_player_effects_dml <- function(
   )
   data.table::setorder(est, -effect_runs_per_ball)
 
-  balls <- prepared$frame[, .N, by = batter_id]
+  balls <- prepared$frame[, .N, by = striker_id]
   data.table::setnames(balls, "N", "balls_faced")
-  est <- balls[est, on = "batter_id"]
+  est <- balls[est, on = "striker_id"]
 
   list(
     estimates = est,
@@ -148,9 +148,9 @@ plot_player_effects <- function(estimates, out_path = NULL, top_n = 30L) {
   }
   dt <- data.table::copy(estimates)
   dt <- utils::head(dt, as.integer(top_n))
-  dt[, batter_id := factor(batter_id, levels = rev(batter_id))]
+  dt[, striker_id := factor(striker_id, levels = rev(striker_id))]
 
-  p <- ggplot2::ggplot(dt, ggplot2::aes(x = effect_runs_per_ball, y = batter_id)) +
+  p <- ggplot2::ggplot(dt, ggplot2::aes(x = effect_runs_per_ball, y = striker_id)) +
     ggplot2::geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
     ggplot2::geom_pointrange(
       ggplot2::aes(xmin = ci_lo, xmax = ci_hi),

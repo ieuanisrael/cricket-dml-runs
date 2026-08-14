@@ -18,44 +18,53 @@ prepare_player_dml_frame <- function(deliveries, min_balls = 80L) {
 
   dt <- data.table::as.data.table(deliveries)
   # Keep batting events with a striker (all rows are strikes in our generator)
-  dt <- dt[!is.na(batter_id) & !is.na(runs_off_bat)]
+  dt <- dt[!is.na(striker_id) & !is.na(bat_score)]
 
-  ball_n <- dt[, .N, by = batter_id]
-  keep <- ball_n[N >= as.integer(min_balls)]$batter_id
-  dt <- dt[batter_id %in% keep]
+  ball_n <- dt[, .N, by = striker_id]
+  keep <- ball_n[N >= as.integer(min_balls)]$striker_id
+  dt <- dt[striker_id %in% keep]
 
   # Reference: most balls faced (stable baseline)
-  ref <- ball_n[batter_id %in% keep][which.max(N)]$batter_id
+  ref <- ball_n[striker_id %in% keep][which.max(N)]$striker_id
 
   dt[, `:=`(
-    series_league = factor(series_league),
+    #series = factor(series),
     venue = factor(venue),
     season = factor(season),
-    phase = factor(phase, levels = c("powerplay", "middle", "death")),
+    phase = factor(phase),
     innings = factor(innings),
     bowler_id = factor(bowler_id),
-    day_night = as.integer(day_night),
+    #day_night = as.integer(day_night),
     batter_is_home = as.integer(batter_is_home),
     over_z = as.numeric(scale(over)),
-    batting_position_z = as.numeric(scale(batting_position))
+    batting_position_z = as.numeric(scale(striker_batting_position))
   )]
 
-  y <- as.numeric(dt$runs_off_bat)
+  y <- as.numeric(dt$bat_score)
 
   # Treatment matrix: batter dummies excluding reference
-  batter_fac <- factor(dt$batter_id)
+  batter_fac <- factor(dt$striker_id)
   batter_levels <- setdiff(levels(batter_fac), ref)
-  D <- Matrix::sparse.model.matrix(~ 0 + batter_id, data = dt)
-  keep_cols <- setdiff(colnames(D), paste0("batter_id", ref))
-  # colnames are batter_idBatter_001 style
-  ref_col <- paste0("batter_id", ref)
+  D <- Matrix::sparse.model.matrix(~ 0 + striker_id, data = dt)
+  keep_cols <- setdiff(colnames(D), paste0("striker_id", ref))
+  # colnames are striker_idBatter_001 style
+  ref_col <- paste0("striker_id", ref)
   D <- D[, setdiff(colnames(D), ref_col), drop = FALSE]
-  colnames(D) <- sub("^batter_id", "", colnames(D))
+  colnames(D) <- sub("^striker_id", "", colnames(D))
 
   # Controls: everything that confounds batter assignment / scoring except batter
   X <- Matrix::sparse.model.matrix(
-    ~ 0 + series_league + venue + season + phase + innings +
-      bowler_id + day_night + batter_is_home + over_z + batting_position_z,
+    ~ 0 + 
+      #series + 
+      venue + 
+      #season + 
+      phase + 
+      #innings +
+      bowler_id + 
+      #day_night + 
+      batter_is_home + 
+      over_z + 
+      batting_position_z,
     data = dt
   )
 
