@@ -24,11 +24,34 @@ Cluster-robust SEs use **match_id**. Multiple testing across batters uses BH–F
 | **R** ≥ 4.1 | Runtime |
 | **data.table** | Data wrangling / I/O |
 | **Matrix** | Sparse design matrices |
-| **glmnet** | Cross-fitted nuisance models |
+| **glmnet** | Cross-fitted nuisance models (default pipeline) |
+| **caret** + **xgboost** | Large-data DML (`R/run_dml_caret_gpu.R`); optional GPU via XGBoost CUDA |
 | **ggplot2** | Forest plots |
 
 ```r
-install.packages(c("data.table", "Matrix", "glmnet", "ggplot2"))
+install.packages(c("data.table", "Matrix", "glmnet", "ggplot2", "caret", "xgboost"))
+```
+
+### Large-data caret / GPU DML
+
+caret is **not** itself a GPU library. GPU speedups come from an **XGBoost CUDA build** used for \(E[Y \mid X]\). Striker-dummy nuisances still use sparse **glmnet** (caret-per-player would be too slow).
+
+```bash
+# CPU (works with CRAN xgboost)
+Rscript R/run_dml_caret_gpu.R \
+  --data=data/raw/t20_ball_by_ball.csv \
+  --gpu=false \
+  --folds=3 \
+  --out=outputs/run_caret_cpu
+
+# GPU (requires xgboost built with CUDA)
+Rscript R/run_dml_caret_gpu.R \
+  --data=/path/to/real_bbb.csv \
+  --gpu=true \
+  --folds=5 \
+  --min-balls=100 \
+  --nrounds=300 \
+  --out=outputs/run_caret_gpu
 ```
 
 ## Quick start
