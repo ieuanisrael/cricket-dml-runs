@@ -2,18 +2,22 @@
 #'
 #' Partially linear model: Y = D θ + g(X) + ε, with E[ε | D, X] = 0.
 #' Nuisances ĝ(X) = E[Y | X] and m̂(X) = E[D | X] estimated by cv.glmnet
-#' with K-fold cross-fitting, then OLS of residual Y on residual D.
+#' with K-fold cross-fitting, then (optionally weighted) OLS of residual Y
+#' on residual D.
 #'
 #' @param prepared Output of [prepare_player_dml_frame].
 #' @param n_folds Cross-fitting folds.
 #' @param seed RNG seed for folds.
 #' @param cluster Optional cluster vector (e.g. match_id) for clustered SEs.
+#' @param weights Optional observation weights (e.g. from
+#'   [compute_selection_weights]).
 #' @return data.table of player effects with SE / CI, plus diagnostics list.
 estimate_player_effects_dml <- function(
     prepared,
     n_folds = 5L,
     seed = 42L,
-    cluster = NULL
+    cluster = NULL,
+    weights = NULL
 ) {
   if (!requireNamespace("glmnet", quietly = TRUE)) {
     stop("Install glmnet: install.packages(\"glmnet\")", call. = FALSE)
@@ -31,6 +35,14 @@ estimate_player_effects_dml <- function(
   n <- length(y)
   p <- ncol(D)
 
+  if (is.null(weights)) {
+    weights <- rep(1, n)
+  }
+  weights <- as.numeric(weights)
+  stopifnot(length(weights) == n, all(is.finite(weights)), all(weights >= 0))
+  if (sum(weights) <= 0) stop("weights must have positive sum", call. = FALSE)
+  weights <- weights / mean(weights)
+
   if (is.null(cluster)) {
     cluster <- prepared$frame$match_id
   }
@@ -47,11 +59,13 @@ estimate_player_effects_dml <- function(
   for (k in seq_len(n_folds)) {
     test <- fold_id == k
     train <- !test
+    w_train <- weights[train]
 
     # E[Y | X]
     fit_y <- glmnet::cv.glmnet(
       x = X[train, , drop = FALSE],
       y = y[train],
+      weights = w_train,
       family = "gaussian",
       alpha = 0.5,
       nfolds = 3L,
@@ -73,6 +87,7 @@ estimate_player_effects_dml <- function(
       fit_d <- glmnet::cv.glmnet(
         x = X_train,
         y = d_j,
+        weights = w_train,
         family = "gaussian",
         alpha = 0.5,
         nfolds = 3L,
@@ -83,21 +98,23 @@ estimate_player_effects_dml <- function(
     }
   }
 
-  # OLS on residuals (no intercept: D is relative to reference batter)
-  DtD <- as.matrix(Matrix::crossprod(D_resid))
-  Dty <- as.numeric(Matrix::crossprod(D_resid, y_resid))
-  # ridge-stabilize if near-collinear
+  # Weighted OLS on residuals via sqrt(w) row scaling
+  sw <- sqrt(weights)
+  D_w <- D_resid * sw
+  y_w <- y_resid * sw
+  DtD <- as.matrix(Matrix::crossprod(D_w))
+  Dty <- as.numeric(Matrix::crossprod(D_w, y_w))
   ridge <- 1e-8 * mean(diag(DtD))
   theta <- as.numeric(solve(DtD + diag(ridge, p), Dty))
   names(theta) <- colnames(D)
 
-  # Cluster-robust sandwich variance
+  # Cluster-robust sandwich with weights
   u <- as.numeric(y_resid - D_resid %*% theta)
   meat <- Matrix::Matrix(0, p, p, sparse = FALSE)
   unique_c <- unique(cluster)
   for (cl in unique_c) {
     ix <- which(cluster == cl)
-    score <- Matrix::crossprod(D_resid[ix, , drop = FALSE], u[ix])
+    score <- Matrix::crossprod(D_resid[ix, , drop = FALSE], weights[ix] * u[ix])
     meat <- meat + Matrix::tcrossprod(score)
   }
   bread <- solve(DtD + diag(ridge, p))
@@ -106,7 +123,6 @@ estimate_player_effects_dml <- function(
 
   z <- theta / se
   pval <- 2 * stats::pnorm(-abs(z))
-  # BH-FDR across batters
   fdr <- stats::p.adjust(pval, method = "BH")
 
   est <- data.table::data.table(
@@ -134,9 +150,12 @@ estimate_player_effects_dml <- function(
       n_clusters = length(unique_c),
       reference_batter = prepared$reference_batter,
       mean_abs_y_resid = mean(abs(y_resid)),
+      weight_method = attr(weights, "method"),
+      weight_max = max(weights),
       seed = as.integer(seed)
     ),
-    residuals = list(y = y_resid) # D residuals large; omit by default
+    weights = weights,
+    residuals = list(y = y_resid)
   )
 }
 
