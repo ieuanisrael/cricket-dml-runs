@@ -1,11 +1,20 @@
 #!/usr/bin/env Rscript
-#' GPU neural-net training with k-fold cross-validation (torch).
+#' Double / debiased ML demo with mixed-type covariates and GPU nuisances.
+#'
+#' Partially linear model:
+#'   Y = θ D + g(X) + ε
+#' with cross-fitted neural estimates of E[Y|X] and E[D|X] on GPU (torch),
+#' then OLS on residuals for θ.
+#'
+#' Covariates intentionally mix:
+#'   - continuous numeric
+#'   - binary
+#'   - unordered categorical
+#'   - ordered / ordinal
 #'
 #' Usage:
 #'   Rscript test.R
-#'   Rscript test.R --folds=5 --epochs=30 --batch-size=128 --lr=0.001
-#'
-#' Requires: torch (with CUDA build for GPU). Falls back to CPU if CUDA is absent.
+#'   Rscript test.R --folds=5 --epochs=20 --n=2000 --require-gpu=true
 
 suppressPackageStartupMessages({
   if (!requireNamespace("torch", quietly = TRUE)) {
@@ -22,382 +31,424 @@ parse_flag <- function(flag, default) {
 }
 
 n_folds <- as.integer(parse_flag("--folds", "5"))
-epochs <- as.integer(parse_flag("--epochs", "25"))
+epochs <- as.integer(parse_flag("--epochs", "20"))
 batch_size <- as.integer(parse_flag("--batch-size", "128"))
 lr <- as.numeric(parse_flag("--lr", "0.001"))
-n_obs <- as.integer(parse_flag("--n", "1500"))
+n_obs <- as.integer(parse_flag("--n", "2000"))
 seed <- as.integer(parse_flag("--seed", "123"))
+true_theta <- as.numeric(parse_flag("--theta", "1.5"))
 require_gpu <- tolower(parse_flag("--require-gpu", "false")) %in% c("1", "true", "t", "yes")
 
 set.seed(seed)
 torch_manual_seed(seed)
 
-# -----------------------------------------------------
-# Device: prefer CUDA GPU
-# -----------------------------------------------------
+# =============================================================================
+# Device
+# =============================================================================
 
 resolve_device <- function(require_gpu = FALSE) {
-  cuda_ok <- isTRUE(cuda_is_available())
-  if (cuda_ok) {
-    n_gpu <- cuda_device_count()
-    message(sprintf("CUDA available (%d device(s)). Using GPU 0.", n_gpu))
-    # Warm-up allocation so failures surface early
-    tryCatch(
-      {
-        tmp <- torch_tensor(1, device = "cuda")
-        rm(tmp)
-        cuda_synchronize()
-      },
-      error = function(e) {
-        stop("CUDA reported available but tensor alloc failed: ", conditionMessage(e), call. = FALSE)
-      }
-    )
+  if (isTRUE(cuda_is_available())) {
+    message(sprintf("CUDA available (%d device(s)). Using GPU 0.", cuda_device_count()))
+    tryCatch({
+      tmp <- torch_tensor(1, device = "cuda")
+      rm(tmp)
+      cuda_synchronize()
+    }, error = function(e) {
+      stop("CUDA alloc failed: ", conditionMessage(e), call. = FALSE)
+    })
     return(torch_device("cuda"))
   }
   if (require_gpu) {
     stop("CUDA not available and --require-gpu=true was set.", call. = FALSE)
   }
-  message("CUDA not available; training on CPU.")
+  message("CUDA not available; training nuisances on CPU.")
   torch_device("cpu")
 }
 
 device <- resolve_device(require_gpu = require_gpu)
 
-# -----------------------------------------------------
-# Dataset (synthetic binary classification)
-# Labels are 1/2 for torch R cross-entropy (1-based classes).
-# -----------------------------------------------------
+# =============================================================================
+# Mixed-type data-generating process
+# =============================================================================
 
-make_data <- function(n = 1200L, p = 25L, signal = 1.0) {
-  x <- matrix(rnorm(n * p), nrow = n, ncol = p)
-  linear_score <- rowSums(x[, 1:8, drop = FALSE]) * signal + 0.5 * x[, 9]
-  prob <- plogis(linear_score)
-  y01 <- rbinom(n, size = 1L, prob = prob)
+#' Simulate a cricket-flavoured DML toy world with heterogeneous X.
+#'
+#' Returns a data.frame of raw mixed types plus encoded matrices and truth.
+make_mixed_dml_data <- function(n = 2000L, theta = 1.5) {
+  # --- Continuous numeric ---
+  opp_strength <- rnorm(n, 0, 1)          # standardised opposition strength
+  over_frac <- runif(n, 0, 1)             # progress through innings
+  ball_speed <- rnorm(n, 135, 8)          # km/h-ish
+
+  # --- Binary ---
+  is_home <- rbinom(n, 1L, 0.55)
+  day_night <- rbinom(n, 1L, 0.65)
+
+  # --- Unordered categorical ---
+  venue <- sample(c("Coastal", "Capital", "Highland", "Desert"), n, replace = TRUE,
+                  prob = c(0.35, 0.30, 0.20, 0.15))
+  phase <- sample(c("powerplay", "middle", "death"), n, replace = TRUE,
+                  prob = c(0.30, 0.45, 0.25))
+  bowler_hand <- sample(c("left", "right"), n, replace = TRUE, prob = c(0.28, 0.72))
+
+  # --- Ordinal ---
+  # batting position 1 (opener) ... 7 (lower); treat as ordered
+  batting_position <- sample(1:7, n, replace = TRUE, prob = c(0.18, 0.16, 0.16, 0.14, 0.14, 0.12, 0.10))
+  # pitch quality rating 1 (poor) ... 5 (excellent)
+  pitch_rating <- sample(1:5, n, replace = TRUE, prob = c(0.10, 0.20, 0.35, 0.25, 0.10))
+
+  raw <- data.frame(
+    opp_strength = opp_strength,
+    over_frac = over_frac,
+    ball_speed = ball_speed,
+    is_home = factor(is_home, levels = c(0, 1), labels = c("away", "home")),
+    day_night = factor(day_night, levels = c(0, 1), labels = c("day", "night")),
+    venue = factor(venue, levels = c("Coastal", "Capital", "Highland", "Desert")),
+    phase = factor(phase, levels = c("powerplay", "middle", "death")),
+    bowler_hand = factor(bowler_hand, levels = c("left", "right")),
+    batting_position = factor(batting_position, levels = 1:7, ordered = TRUE),
+    pitch_rating = factor(pitch_rating, levels = 1:5, ordered = TRUE),
+    stringsAsFactors = FALSE
+  )
+
+  # Variable-type dictionary for documentation / checks
+  var_types <- data.frame(
+    variable = c(
+      "opp_strength", "over_frac", "ball_speed",
+      "is_home", "day_night",
+      "venue", "phase", "bowler_hand",
+      "batting_position", "pitch_rating"
+    ),
+    type = c(
+      "numeric", "numeric", "numeric",
+      "binary", "binary",
+      "categorical", "categorical", "categorical",
+      "ordinal", "ordinal"
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  enc <- encode_mixed_features(raw)
+
+  # Nonlinear confounding g(X) used in both propensity and outcome
+  g <- 0.35 * enc$X_scaled[, "opp_strength"] +
+    0.25 * sin(2 * pi * enc$X_scaled[, "over_frac"]) -
+    0.15 * enc$X_scaled[, "ball_speed"] +
+    0.20 * (raw$is_home == "home") +
+    0.10 * (raw$phase == "death") -
+    0.12 * (raw$venue == "Desert") +
+    0.08 * as.numeric(raw$batting_position) / 7 +
+    0.05 * as.numeric(raw$pitch_rating) / 5 +
+    0.15 * enc$X_scaled[, "opp_strength"] * (raw$phase == "death")
+
+  # Treatment propensity depends on X (selection into "aggressive intent" / matchup)
+  e <- plogis(-0.2 + 0.6 * g + 0.3 * (raw$bowler_hand == "left"))
+  D <- rbinom(n, 1L, e)
+
+  # Outcome: partially linear — θ is the causal effect of D
+  Y <- theta * D + g + rnorm(n, 0, 0.75)
+
   list(
-    x = scale(x),
-    y = as.integer(y01 + 1L), # class ids in {1, 2}
-    y01 = y01,
-    n_features = p,
-    n_classes = 2L
+    raw = raw,
+    X = enc$X,                 # model matrix (numeric columns, dummies, ordinal codes)
+    X_scaled = enc$X_scaled,
+    feature_info = enc$feature_info,
+    var_types = var_types,
+    D = as.numeric(D),
+    Y = as.numeric(Y),
+    true_theta = theta,
+    true_propensity = e,
+    n = n
   )
 }
 
-# -----------------------------------------------------
-# Mini-batch iterator (tensors created on device)
-# -----------------------------------------------------
+#' Encode mixed-type data.frame -> numeric design matrix.
+#'
+#' - numeric: left as-is then column-scaled for the net
+#' - binary / categorical: treatment contrasts (drop first level)
+#' - ordinal: integer codes 1..L (monotonic numeric embedding)
+encode_mixed_features <- function(df) {
+  stopifnot(is.data.frame(df))
+  pieces <- list()
+  info <- list()
+
+  for (nm in names(df)) {
+    v <- df[[nm]]
+    if (is.ordered(v)) {
+      # Ordinal: integer score in [1, L]
+      code <- as.numeric(v)
+      mat <- matrix(code, ncol = 1L, dimnames = list(NULL, nm))
+      pieces[[nm]] <- mat
+      info[[nm]] <- list(type = "ordinal", levels = levels(v), cols = nm)
+    } else if (is.factor(v) || is.character(v)) {
+      v <- factor(v)
+      # Unordered: full-rank dummy encoding without intercept column per factor
+      mm <- stats::model.matrix(~ 0 + v)
+      colnames(mm) <- paste0(nm, "=", gsub("^v", "", colnames(mm)))
+      # Drop first level for identification (reference)
+      ref <- levels(v)[[1]]
+      drop_col <- paste0(nm, "=", ref)
+      keep <- setdiff(colnames(mm), drop_col)
+      mm <- mm[, keep, drop = FALSE]
+      pieces[[nm]] <- mm
+      info[[nm]] <- list(type = "categorical", levels = levels(v), reference = ref, cols = colnames(mm))
+    } else {
+      mat <- matrix(as.numeric(v), ncol = 1L, dimnames = list(NULL, nm))
+      pieces[[nm]] <- mat
+      info[[nm]] <- list(type = "numeric", cols = nm)
+    }
+  }
+
+  X <- do.call(cbind, pieces)
+  # Column-scale for neural nets (preserve column names)
+  mu <- colMeans(X)
+  sds <- apply(X, 2L, stats::sd)
+  sds[!is.finite(sds) | sds < 1e-8] <- 1
+  X_scaled <- sweep(sweep(X, 2L, mu, "-"), 2L, sds, "/")
+  colnames(X_scaled) <- colnames(X)
+
+  list(
+    X = X,
+    X_scaled = X_scaled,
+    feature_info = info,
+    center = mu,
+    scale = sds
+  )
+}
+
+# =============================================================================
+# GPU regressor for nuisance functions E[· | X]
+# =============================================================================
+
+build_regressor <- function(input_dim, hidden_1 = 64L, hidden_2 = 32L) {
+  nn_sequential(
+    nn_linear(input_dim, hidden_1),
+    nn_relu(),
+    nn_dropout(0.15),
+    nn_linear(hidden_1, hidden_2),
+    nn_relu(),
+    nn_linear(hidden_2, 1L)
+  )
+}
 
 batch_iterator <- function(x, y, batch_size, device, shuffle = TRUE) {
   n <- nrow(x)
   order_idx <- if (shuffle) sample.int(n) else seq_len(n)
   starts <- seq(1L, n, by = batch_size)
-
-  force(x)
-  force(y)
-  force(device)
-
   i <- 0L
+  force(x); force(y); force(device)
   function() {
     i <<- i + 1L
-    if (i > length(starts)) {
-      return(NULL)
-    }
+    if (i > length(starts)) return(NULL)
     from <- starts[[i]]
     to <- min(from + batch_size - 1L, n)
     idx <- order_idx[from:to]
     list(
       x = torch_tensor(x[idx, , drop = FALSE], dtype = torch_float(), device = device),
-      y = torch_tensor(y[idx], dtype = torch_long(), device = device)
+      y = torch_tensor(matrix(y[idx], ncol = 1L), dtype = torch_float(), device = device)
     )
   }
 }
 
-# -----------------------------------------------------
-# Model
-# -----------------------------------------------------
-
-build_model <- function(input_dim, n_classes = 2L, hidden_1 = 64L, hidden_2 = 32L) {
-  nn_sequential(
-    nn_linear(input_dim, hidden_1),
-    nn_relu(),
-    nn_dropout(0.2),
-    nn_linear(hidden_1, hidden_2),
-    nn_relu(),
-    nn_dropout(0.1),
-    nn_linear(hidden_2, n_classes)
-  )
-}
-
-# -----------------------------------------------------
-# Train / evaluate on a fixed device
-# -----------------------------------------------------
-
-train_model <- function(
+train_regressor <- function(
     x_train,
     y_train,
-    x_val = NULL,
-    y_val = NULL,
-    epochs = 25L,
+    epochs = 20L,
     batch_size = 128L,
     lr = 1e-3,
     device,
-    verbose = TRUE
+    verbose = FALSE
 ) {
-  model <- build_model(ncol(x_train), n_classes = length(unique(y_train)))
+  model <- build_regressor(ncol(x_train))
   model$to(device = device)
-
   optimizer <- optim_adam(model$parameters, lr = lr)
-  loss_fn <- nn_cross_entropy_loss()
-
-  history <- data.frame(
-    epoch = integer(),
-    train_loss = numeric(),
-    val_loss = numeric(),
-    val_accuracy = numeric()
-  )
+  loss_fn <- nn_mse_loss()
 
   for (epoch in seq_len(epochs)) {
     model$train()
     next_batch <- batch_iterator(x_train, y_train, batch_size, device, shuffle = TRUE)
     epoch_loss <- 0
     n_batches <- 0L
-
     repeat {
       batch <- next_batch()
       if (is.null(batch)) break
-
       optimizer$zero_grad()
-      logits <- model(batch$x)
-      loss <- loss_fn(logits, batch$y)
+      pred <- model(batch$x)
+      loss <- loss_fn(pred, batch$y)
       loss$backward()
       optimizer$step()
-
       epoch_loss <- epoch_loss + loss$item()
       n_batches <- n_batches + 1L
     }
-
-    train_loss <- epoch_loss / max(1L, n_batches)
-    val_loss <- NA_real_
-    val_acc <- NA_real_
-
-    if (!is.null(x_val) && !is.null(y_val) && nrow(x_val) > 0) {
-      metrics <- evaluate_model(model, x_val, y_val, device)
-      val_loss <- metrics$loss
-      val_acc <- metrics$accuracy
-    }
-
-    history <- rbind(
-      history,
-      data.frame(
-        epoch = epoch,
-        train_loss = train_loss,
-        val_loss = val_loss,
-        val_accuracy = val_acc
-      )
-    )
-
     if (verbose) {
-      if (is.finite(val_acc)) {
-        cat(sprintf(
-          "Epoch %02d | train_loss=%.4f | val_loss=%.4f | val_acc=%.4f\n",
-          epoch, train_loss, val_loss, val_acc
-        ))
-      } else {
-        cat(sprintf("Epoch %02d | train_loss=%.4f\n", epoch, train_loss))
-      }
+      cat(sprintf("  epoch %02d | mse=%.4f\n", epoch, epoch_loss / max(1L, n_batches)))
     }
   }
-
-  if (device$type == "cuda") {
-    cuda_synchronize()
-  }
-
-  list(model = model, history = history)
+  if (device$type == "cuda") cuda_synchronize()
+  model
 }
 
-evaluate_model <- function(model, x_eval, y_eval, device) {
+predict_regressor <- function(model, x_new, device) {
   model$eval()
   with_no_grad({
-    xt <- torch_tensor(x_eval, dtype = torch_float(), device = device)
-    yt <- torch_tensor(y_eval, dtype = torch_long(), device = device)
-    logits <- model(xt)
-    loss <- nn_cross_entropy_loss()(logits, yt)$item()
-    pred <- as.integer(as.array(logits$argmax(dim = 2L)$to(device = "cpu")))
-    accuracy <- mean(pred == as.integer(y_eval))
-    list(accuracy = accuracy, loss = loss, pred = pred)
+    xt <- torch_tensor(x_new, dtype = torch_float(), device = device)
+    as.numeric(as.array(model(xt)$to(device = "cpu")))
   })
 }
 
-# -----------------------------------------------------
-# K-fold cross-validation (each fold trains on GPU)
-# -----------------------------------------------------
+# =============================================================================
+# Cross-fitted Double ML (partially linear ATE)
+# =============================================================================
 
-run_cv <- function(
-    x,
-    y,
-    k = 5L,
-    epochs = 25L,
+#' Cross-fitted DML for binary treatment with neural nuisances on `device`.
+estimate_dml_ate <- function(
+    X,
+    D,
+    Y,
+    n_folds = 5L,
+    epochs = 20L,
     batch_size = 128L,
     lr = 1e-3,
-    device
+    device,
+    seed = 123L,
+    verbose = TRUE
 ) {
-  n <- nrow(x)
-  folds <- sample(rep(seq_len(k), length.out = n))
+  n <- nrow(X)
+  set.seed(seed)
+  fold_id <- sample(rep(seq_len(n_folds), length.out = n))
 
-  fold_accuracy <- numeric(k)
-  fold_loss <- numeric(k)
-  fold_models <- vector("list", k)
+  y_hat <- rep(NA_real_, n)
+  d_hat <- rep(NA_real_, n)
 
-  message(sprintf(
-    "\nStarting %d-fold CV on device=%s | n=%d | p=%d | epochs=%d | batch=%d",
-    k, device$type, n, ncol(x), epochs, batch_size
-  ))
+  if (verbose) {
+    message(sprintf(
+      "DML cross-fitting: folds=%d | n=%d | p=%d | device=%s | epochs=%d",
+      n_folds, n, ncol(X), device$type, epochs
+    ))
+  }
 
-  for (fold in seq_len(k)) {
-    test_idx <- which(folds == fold)
-    train_idx <- which(folds != fold)
+  for (k in seq_len(n_folds)) {
+    test <- fold_id == k
+    train <- !test
+    if (verbose) {
+      cat(sprintf("\n=== Fold %d/%d (train=%d, test=%d) ===\n",
+                  k, n_folds, sum(train), sum(test)))
+    }
 
-    cat(sprintf("\n=== Fold %d/%d (train=%d, val=%d) ===\n",
-                fold, k, length(train_idx), length(test_idx)))
-
-    fit <- train_model(
-      x_train = x[train_idx, , drop = FALSE],
-      y_train = y[train_idx],
-      x_val = x[test_idx, , drop = FALSE],
-      y_val = y[test_idx],
+    if (verbose) cat("Fitting E[Y | X] ...\n")
+    m_y <- train_regressor(
+      x_train = X[train, , drop = FALSE],
+      y_train = Y[train],
       epochs = epochs,
       batch_size = batch_size,
       lr = lr,
       device = device,
-      verbose = TRUE
+      verbose = verbose
     )
+    y_hat[test] <- predict_regressor(m_y, X[test, , drop = FALSE], device)
 
-    metrics <- evaluate_model(
-      fit$model,
-      x[test_idx, , drop = FALSE],
-      y[test_idx],
-      device
+    if (verbose) cat("Fitting E[D | X] ...\n")
+    m_d <- train_regressor(
+      x_train = X[train, , drop = FALSE],
+      y_train = D[train],
+      epochs = epochs,
+      batch_size = batch_size,
+      lr = lr,
+      device = device,
+      verbose = verbose
     )
-    fold_accuracy[[fold]] <- metrics$accuracy
-    fold_loss[[fold]] <- metrics$loss
-    fold_models[[fold]] <- fit$model
-
-    cat(sprintf(
-      "Fold %d held-out | loss=%.4f | accuracy=%.4f\n",
-      fold, metrics$loss, metrics$accuracy
-    ))
+    d_hat[test] <- predict_regressor(m_d, X[test, , drop = FALSE], device)
   }
 
+  # Residual-on-residual OLS (ATE)
+  y_resid <- Y - y_hat
+  d_resid <- D - d_hat
+  theta_hat <- sum(d_resid * y_resid) / sum(d_resid^2)
+  u <- y_resid - theta_hat * d_resid
+
+  # HC1-style robust SE
+  n_eff <- n
+  meat <- mean((d_resid^2) * (u^2))
+  bread <- mean(d_resid^2)
+  se <- sqrt(meat / (n_eff * bread^2))
+  ci <- theta_hat + c(-1.96, 1.96) * se
+
   list(
-    fold_accuracy = fold_accuracy,
-    fold_loss = fold_loss,
-    mean_accuracy = mean(fold_accuracy),
-    sd_accuracy = stats::sd(fold_accuracy),
-    mean_loss = mean(fold_loss),
-    models = fold_models,
-    folds = folds
+    theta = theta_hat,
+    se = se,
+    ci_lo = ci[[1]],
+    ci_hi = ci[[2]],
+    y_resid = y_resid,
+    d_resid = d_resid,
+    y_hat = y_hat,
+    d_hat = d_hat,
+    fold_id = fold_id,
+    diagnostics = list(
+      n = n,
+      p = ncol(X),
+      n_folds = n_folds,
+      device = device$type,
+      mean_abs_y_resid = mean(abs(y_resid)),
+      mean_abs_d_resid = mean(abs(d_resid)),
+      corr_d_dhat = stats::cor(D, d_hat)
+    )
   )
 }
 
-# -----------------------------------------------------
-# Hold-out split + CV on train + final GPU refit
-# -----------------------------------------------------
-
-train_test_with_cv <- function(
-    x,
-    y,
-    device,
-    test_fraction = 0.2,
-    cv_folds = 5L,
-    epochs = 25L,
-    batch_size = 128L,
-    lr = 1e-3
-) {
-  n <- nrow(x)
-  test_n <- max(1L, floor(n * test_fraction))
-  test_idx <- sample.int(n, size = test_n)
-  train_idx <- setdiff(seq_len(n), test_idx)
-
-  cat(sprintf(
-    "\nDevice: %s | Training rows: %d | Test rows: %d\n",
-    device$type, length(train_idx), length(test_idx)
-  ))
-
-  cv_results <- run_cv(
-    x = x[train_idx, , drop = FALSE],
-    y = y[train_idx],
-    k = cv_folds,
-    epochs = epochs,
-    batch_size = batch_size,
-    lr = lr,
-    device = device
-  )
-
-  cat("\n=== Final refit on full training set (GPU) ===\n")
-  final_fit <- train_model(
-    x_train = x[train_idx, , drop = FALSE],
-    y_train = y[train_idx],
-    x_val = x[test_idx, , drop = FALSE],
-    y_val = y[test_idx],
-    epochs = epochs,
-    batch_size = batch_size,
-    lr = lr,
-    device = device,
-    verbose = TRUE
-  )
-
-  final_metrics <- evaluate_model(
-    final_fit$model,
-    x[test_idx, , drop = FALSE],
-    y[test_idx],
-    device
-  )
-
-  list(
-    cv = cv_results,
-    final_test_accuracy = final_metrics$accuracy,
-    final_test_loss = final_metrics$loss,
-    model = final_fit$model,
-    history = final_fit$history,
-    test_idx = test_idx,
-    train_idx = train_idx,
-    device = device$type
-  )
-}
-
-# -----------------------------------------------------
+# =============================================================================
 # Main
-# -----------------------------------------------------
+# =============================================================================
 
-cat("============================\n")
-cat("GPU training + cross-validation\n")
-cat("============================\n")
+cat("============================================================\n")
+cat("Double ML with mixed-type covariates (GPU neural nuisances)\n")
+cat("============================================================\n")
 
-sim_data <- make_data(n = n_obs, p = 30L, signal = 1.2)
+dat <- make_mixed_dml_data(n = n_obs, theta = true_theta)
 
-results <- train_test_with_cv(
-  x = sim_data$x,
-  y = sim_data$y,
-  device = device,
-  test_fraction = 0.2,
-  cv_folds = n_folds,
+cat("\nVariable types in X:\n")
+print(dat$var_types, row.names = FALSE)
+
+cat(sprintf(
+  "\nEncoded design: n=%d | p=%d columns after expanding categoricals/ordinals\n",
+  dat$n, ncol(dat$X_scaled)
+))
+cat("Feature columns:\n")
+cat(paste(" -", colnames(dat$X_scaled)), sep = "\n")
+cat(sprintf("\nTrue θ = %.4f | mean(D)=%.3f | mean(Y)=%.3f\n",
+            dat$true_theta, mean(dat$D), mean(dat$Y)))
+
+fit <- estimate_dml_ate(
+  X = dat$X_scaled,
+  D = dat$D,
+  Y = dat$Y,
+  n_folds = n_folds,
   epochs = epochs,
   batch_size = batch_size,
-  lr = lr
+  lr = lr,
+  device = device,
+  seed = seed,
+  verbose = TRUE
 )
 
-cat("\n============================\n")
-cat("Cross-validation summary\n")
-cat("============================\n")
-cat(sprintf("Device: %s\n", results$device))
-cat(sprintf("Fold accuracies: %s\n", paste(sprintf("%.4f", results$cv$fold_accuracy), collapse = ", ")))
-cat(sprintf("Mean CV accuracy: %.4f ± %.4f\n", results$cv$mean_accuracy, results$cv$sd_accuracy))
-cat(sprintf("Mean CV loss: %.4f\n", results$cv$mean_loss))
+cat("\n============================================================\n")
+cat("DML results\n")
+cat("============================================================\n")
+cat(sprintf("Device:              %s\n", fit$diagnostics$device))
+cat(sprintf("Folds:               %d\n", fit$diagnostics$n_folds))
+cat(sprintf("True θ:              %.4f\n", dat$true_theta))
+cat(sprintf("DML θ̂:              %.4f\n", fit$theta))
+cat(sprintf("Robust SE:           %.4f\n", fit$se))
+cat(sprintf("95%% CI:              [%.4f, %.4f]\n", fit$ci_lo, fit$ci_hi))
+cat(sprintf("Error θ̂ − θ:         %.4f\n", fit$theta - dat$true_theta))
+cat(sprintf("Mean |Y residual|:   %.4f\n", fit$diagnostics$mean_abs_y_resid))
+cat(sprintf("Mean |D residual|:   %.4f\n", fit$diagnostics$mean_abs_d_resid))
+cat(sprintf("Corr(D, D̂):          %.4f\n", fit$diagnostics$corr_d_dhat))
 
-cat("\n============================\n")
-cat("Final hold-out test metrics\n")
-cat("============================\n")
-cat(sprintf("Test accuracy: %.4f\n", results$final_test_accuracy))
-cat(sprintf("Test loss: %.4f\n", results$final_test_loss))
+# Naive OLS of Y on D only (confounded) for contrast
+naive <- stats::lm(dat$Y ~ dat$D)
+naive_theta <- unname(stats::coef(naive)[["dat$D"]])
+cat(sprintf("\nNaive OLS θ (confounded): %.4f | |bias|=%.4f\n",
+            naive_theta, abs(naive_theta - dat$true_theta)))
+cat(sprintf("DML |bias|:                 %.4f\n", abs(fit$theta - dat$true_theta)))
 
-# Leave results in the global env when sourced interactively
-invisible(results)
+invisible(list(data = dat, fit = fit, naive_theta = naive_theta))
