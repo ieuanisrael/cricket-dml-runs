@@ -37,11 +37,11 @@ parse_bool <- function(flag, default = FALSE) {
   raw %in% c("1", "true", "t", "yes", "y")
 }
 
-data_path <- parse_flag("--data", "data/raw/t20_ball_by_ball.csv")
-min_balls <- as.integer(parse_flag("--min-balls", "80"))
+data_path <- parse_flag("--data", "data/raw/real_bbl_data.csv")
+min_balls <- as.integer(parse_flag("--min-balls", "180"))
 n_folds <- as.integer(parse_flag("--folds", "5"))
 seed <- as.integer(parse_flag("--seed", "42"))
-use_gpu <- parse_bool("--gpu", FALSE)
+use_gpu <- parse_bool("--gpu", TRUE)
 caret_method <- parse_flag("--method", "xgbTree")
 xgb_nrounds <- as.integer(parse_flag("--nrounds", "200"))
 out_dir <- parse_flag("--out", "outputs/run_caret_gpu")

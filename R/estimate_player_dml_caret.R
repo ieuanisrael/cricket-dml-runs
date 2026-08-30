@@ -23,7 +23,7 @@ estimate_player_effects_dml_caret <- function(
     n_folds = 5L,
     seed = 42L,
     cluster = NULL,
-    use_gpu = FALSE,
+    use_gpu = TRUE,
     caret_method = c("xgbTree", "glmnet"),
     tune_length = 1L,
     xgb_nrounds = 200L,

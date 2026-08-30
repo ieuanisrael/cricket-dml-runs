@@ -1,0 +1,18 @@
+# Usage:
+#   docker compose build
+#   docker compose run --rm model
+#
+# Override parallel chains:
+#   MC_CORES=4 docker compose run --rm model
+
+services:
+  model:
+    build: .
+    image: cricket-dml-runs:local
+    tty: true
+    environment:
+      BAYES_CRICKET_ROOT: /app
+      MC_CORES: "2"
+    # Uncomment to use a CSV from your machine:
+    # volumes:
+    #   - ./data:/app/data
