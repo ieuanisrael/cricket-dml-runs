@@ -1,0 +1,15 @@
+generated_at: 2026-09-02 14:58:49
+root: /Users/ieuanisrael/git/cricket-dml-runs
+data: synthetic
+n_deliveries: 2812
+n_obs: 2327
+n_strikers_ate: 27
+min_balls: 40
+n_folds: 2
+seed: 42
+weight_method: kernel_exposure
+reference_batter: Batter_035
+model1_ate: outputs/ate_propensity/striker_ate_dml.csv
+model2_propensity: outputs/ate_propensity/striker_propensity.csv
+combined: outputs/ate_propensity/striker_ate_and_propensity.csv
+plots: outputs/ate_propensity/plots

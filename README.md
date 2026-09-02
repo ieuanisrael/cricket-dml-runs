@@ -54,7 +54,19 @@ Rscript R/run_dml_caret_gpu.R \
   --out=outputs/run_caret_gpu
 ```
 
-## Quick start
+### Two-model end goal: ATE + propensity
+
+```bash
+Rscript R/run_ate_propensity.R --matches=40 --min-balls=40 --folds=3 --out=outputs/ate_propensity
+Rscript R/run_ate_propensity.R --data=/path/to/real_bbb.csv --min-balls=80 --folds=5
+```
+
+| Model | Estimand | Output |
+|-------|----------|--------|
+| **1. Striker ATE** | Runs/ball effect of each striker vs reference (DML) | `striker_ate_dml.csv`, `ate_striker_forest.png` |
+| **2. On-strike propensity** | \(P(\text{striker}=j \mid X)\) — being on strike given context | `striker_propensity.csv`, `propensity_striker_bars.png` |
+
+Also writes `ate_vs_propensity_scatter.png`, `propensity_by_over.png`, and `propensity_overlap_top.png`.
 
 From the repo root:
 
