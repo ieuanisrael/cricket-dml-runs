@@ -1,24 +1,25 @@
 #!/usr/bin/env Rscript
-#' Double / debiased ML demo with mixed-type covariates and GPU nuisances.
+#' Double / debiased ML on ball-by-ball data with the real raw schema.
 #'
 #' Partially linear model:
 #'   Y = θ D + g(X) + ε
-#' with cross-fitted neural estimates of E[Y|X] and E[D|X] on GPU (torch),
-#' then OLS on residuals for θ.
+#' Y = bat_score, D = batter_is_home (default; override with --treatment=),
+#' X = mixed-type controls from the raw BBB columns.
 #'
-#' Covariates intentionally mix:
-#'   - continuous numeric
-#'   - binary
-#'   - unordered categorical
-#'   - ordered / ordinal
+#' Cross-fitted GPU/CPU torch nets estimate E[Y|X] and E[D|X]; residual OLS
+#' yields θ.
 #'
 #' Usage:
 #'   Rscript test.R
-#'   Rscript test.R --folds=5 --epochs=20 --n=2000 --require-gpu=true
+#'   Rscript test.R --data=data/raw/real_bbb.csv --folds=5 --epochs=20
+#'   Rscript test.R --n=2000 --treatment=power_play --require-gpu=true
 
 suppressPackageStartupMessages({
   if (!requireNamespace("torch", quietly = TRUE)) {
     stop("Install torch: install.packages(\"torch\"); torch::install_torch()", call. = FALSE)
+  }
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Install data.table: install.packages(\"data.table\")", call. = FALSE)
   }
   library(torch)
 })
@@ -36,11 +37,92 @@ batch_size <- as.integer(parse_flag("--batch-size", "128"))
 lr <- as.numeric(parse_flag("--lr", "0.001"))
 n_obs <- as.integer(parse_flag("--n", "2000"))
 seed <- as.integer(parse_flag("--seed", "123"))
-true_theta <- as.numeric(parse_flag("--theta", "1.5"))
+true_theta <- as.numeric(parse_flag("--theta", "0.35"))
+data_path <- parse_flag("--data", "")
+treatment_col <- parse_flag("--treatment", "batter_is_home")
 require_gpu <- tolower(parse_flag("--require-gpu", "false")) %in% c("1", "true", "t", "yes")
 
 set.seed(seed)
 torch_manual_seed(seed)
+
+# =============================================================================
+# Real raw BBB schema (snake_case)
+# =============================================================================
+
+RAW_BBB_COLUMNS <- c(
+  "match_id",
+  "series",
+  "venue",
+  "season",
+  "team_a_at_home",
+  "team_a_id",
+  "team_batting_id",
+  "team_bowling_id",
+  "home_team",
+  "batter_is_home",
+  "innings",
+  "over",
+  "ball_in_over",
+  "legal_ball",
+  "striker_id",
+  "striker_name",
+  "non_striker_id",
+  "non_striker_name",
+  "striker_hand_id",
+  "striker_batting_position",
+  "bowler_id",
+  "bowler_name",
+  "bowler_hand_id",
+  "power_play",
+  "bat_score",
+  "cumulative_inning_extra_runs",
+  "cumulative_inning_bat_score",
+  "cumulative_inning_wickets",
+  "free_hit",
+  "striker_dismissed",
+  "non_striker_dismissed",
+  "how_out_id",
+  "batter_dismissal"
+)
+
+# Type map for controls used in X (treatment & outcome handled separately)
+CONTROL_VAR_TYPES <- data.frame(
+  variable = c(
+    "series", "venue", "season",
+    "team_a_id", "team_batting_id", "team_bowling_id", "home_team",
+    "team_a_at_home", "power_play", "free_hit", "legal_ball",
+    "innings", "over", "ball_in_over",
+    "striker_batting_position",
+    "striker_hand_id", "bowler_hand_id",
+    "bowler_id",
+    "cumulative_inning_extra_runs", "cumulative_inning_bat_score",
+    "cumulative_inning_wickets"
+  ),
+  type = c(
+    "categorical", "categorical", "categorical",
+    "categorical", "categorical", "categorical", "categorical",
+    "binary", "binary", "binary", "binary",
+    "ordinal", "numeric", "ordinal",
+    "ordinal",
+    "categorical", "categorical",
+    "categorical",
+    "numeric", "numeric",
+    "ordinal"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Columns that must not enter X when estimating effects on bat_score
+# (labels, ids used only for clustering, or same-ball outcomes)
+EXCLUDE_FROM_X <- c(
+  "match_id",
+  "striker_id", "striker_name",
+  "non_striker_id", "non_striker_name",
+  "bowler_name",
+  "bat_score",
+  "striker_dismissed", "non_striker_dismissed",
+  "how_out_id", "batter_dismissal"
+)
 
 # =============================================================================
 # Device
@@ -68,105 +150,243 @@ resolve_device <- function(require_gpu = FALSE) {
 device <- resolve_device(require_gpu = require_gpu)
 
 # =============================================================================
-# Mixed-type data-generating process
+# Simulate / load data in the real schema
 # =============================================================================
 
-#' Simulate a cricket-flavoured DML toy world with heterogeneous X.
+#' Synthetic BBB rows matching RAW_BBB_COLUMNS, with known θ for batter_is_home.
+simulate_real_schema_bbb <- function(n = 2000L, theta = 0.35) {
+  n_matches <- max(20L, as.integer(n / 120))
+  match_id <- sprintf("M%04d", sample.int(n_matches, n, replace = TRUE))
+  series <- sample(c("Premier Smash", "Coastal T20", "Capital League"), n, TRUE,
+                   prob = c(0.45, 0.35, 0.20))
+  venue <- sample(sprintf("Venue_%02d", 1:8), n, TRUE)
+  season <- sample(c("2023/24", "2024/25", "2025/26"), n, TRUE, prob = c(0.3, 0.4, 0.3))
+
+  team_a_id <- sample(sprintf("Team_%02d", 1:12), n, TRUE)
+  team_batting_id <- team_a_id
+  # flip batting team half the time
+  flip <- rbinom(n, 1L, 0.5) == 1L
+  team_bowling_id <- sample(sprintf("Team_%02d", 1:12), n, TRUE)
+  team_bowling_id[flip] <- team_a_id[flip]
+  team_batting_id[flip] <- sample(sprintf("Team_%02d", 1:12), sum(flip), TRUE)
+
+  team_a_at_home <- rbinom(n, 1L, 0.5)
+  home_team <- ifelse(team_a_at_home == 1L, team_a_id, team_bowling_id)
+  batter_is_home <- as.integer(team_batting_id == home_team)
+
+  innings <- sample(1:2, n, TRUE)
+  over <- sample(0:19, n, TRUE)
+  ball_in_over <- sample(1:6, n, TRUE)
+  legal_ball <- rbinom(n, 1L, 0.96)
+
+  striker_id <- sprintf("Batter_%03d", sample.int(48L, n, TRUE))
+  non_striker_id <- sprintf("Batter_%03d", sample.int(48L, n, TRUE))
+  striker_name <- paste0("Player_", striker_id)
+  non_striker_name <- paste0("Player_", non_striker_id)
+  striker_hand_id <- sample(c("L", "R"), n, TRUE, prob = c(0.28, 0.72))
+  striker_batting_position <- sample(1:8, n, TRUE, prob = c(0.16, 0.15, 0.14, 0.13, 0.12, 0.12, 0.10, 0.08))
+
+  bowler_id <- sprintf("Bowler_%03d", sample.int(36L, n, TRUE))
+  bowler_name <- paste0("Player_", bowler_id)
+  bowler_hand_id <- sample(c("L", "R"), n, TRUE, prob = c(0.30, 0.70))
+
+  power_play <- as.integer(over < 6L)
+  free_hit <- rbinom(n, 1L, 0.02)
+
+  # Confounding structure for known θ on batter_is_home
+  g <- 0.15 * power_play +
+    0.04 * over +
+    0.08 * (striker_batting_position <= 3) +
+    0.10 * (bowler_hand_id == "L") +
+    0.05 * (striker_hand_id == "L") -
+    0.03 * innings +
+    0.12 * free_hit
+
+  # Correlate home slightly with context so naive OLS is biased
+  e <- plogis(-0.4 + 0.5 * g + 0.2 * power_play)
+  # Keep simulated home indicator but tilt it via latent draw for DGP of Y
+  # (batter_is_home stays as assigned above; θ multiplies that column)
+  bat_score_mean <- pmax(0.05, 0.9 + theta * batter_is_home + g)
+  bat_score <- vapply(bat_score_mean, function(mu) {
+    probs <- pmax(0.001, c(0.38, 0.32, 0.12, 0.03, 0.10, 0.05) +
+      c(-0.08, -0.02, 0.02, 0.01, 0.04, 0.03) * (mu - 0.9))
+    sample(c(0L, 1L, 2L, 3L, 4L, 6L), 1L, prob = probs / sum(probs))
+  }, integer(1))
+
+  striker_dismissed <- as.integer(rbinom(n, 1L, plogis(-3.0 + 0.15 * over)))
+  non_striker_dismissed <- integer(n)
+  how_out_id <- ifelse(striker_dismissed == 1L,
+                       sample(c("caught", "bowled", "lbw", "run_out"), n, TRUE,
+                              prob = c(0.55, 0.25, 0.12, 0.08)),
+                       NA_character_)
+  batter_dismissal <- how_out_id
+
+  cumulative_inning_bat_score <- as.integer(
+    ave(bat_score, match_id, innings, FUN = cumsum)
+  )
+  cumulative_inning_extra_runs <- as.integer(
+    ave(rbinom(n, 1L, 0.04), match_id, innings, FUN = cumsum)
+  )
+  cumulative_inning_wickets <- as.integer(
+    ave(striker_dismissed, match_id, innings, FUN = cumsum)
+  )
+
+  data.table::data.table(
+    match_id = match_id,
+    series = series,
+    venue = venue,
+    season = season,
+    team_a_at_home = as.integer(team_a_at_home),
+    team_a_id = team_a_id,
+    team_batting_id = team_batting_id,
+    team_bowling_id = team_bowling_id,
+    home_team = home_team,
+    batter_is_home = as.integer(batter_is_home),
+    innings = as.integer(innings),
+    over = as.integer(over),
+    ball_in_over = as.integer(ball_in_over),
+    legal_ball = as.integer(legal_ball),
+    striker_id = striker_id,
+    striker_name = striker_name,
+    non_striker_id = non_striker_id,
+    non_striker_name = non_striker_name,
+    striker_hand_id = striker_hand_id,
+    striker_batting_position = as.integer(striker_batting_position),
+    bowler_id = bowler_id,
+    bowler_name = bowler_name,
+    bowler_hand_id = bowler_hand_id,
+    power_play = as.integer(power_play),
+    bat_score = as.integer(bat_score),
+    cumulative_inning_extra_runs = cumulative_inning_extra_runs,
+    cumulative_inning_bat_score = cumulative_inning_bat_score,
+    cumulative_inning_wickets = cumulative_inning_wickets,
+    free_hit = as.integer(free_hit),
+    striker_dismissed = striker_dismissed,
+    non_striker_dismissed = non_striker_dismissed,
+    how_out_id = how_out_id,
+    batter_dismissal = batter_dismissal
+  )
+}
+
+validate_raw_schema <- function(dt) {
+  miss <- setdiff(RAW_BBB_COLUMNS, names(dt))
+  if (length(miss)) {
+    stop(
+      "Raw BBB missing required columns:\n  ",
+      paste(miss, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+load_real_schema_bbb <- function(path) {
+  if (!file.exists(path)) {
+    stop("Data file not found: ", path, call. = FALSE)
+  }
+  dt <- data.table::fread(path)
+  # tolerate optional extras; require the declared schema
+  validate_raw_schema(dt)
+  dt
+}
+
+# =============================================================================
+# Build DML matrices from real-schema BBB
+# =============================================================================
+
+coerce_control_types <- function(dt, var_types) {
+  out <- data.table::as.data.table(dt)
+  for (i in seq_len(nrow(var_types))) {
+    nm <- var_types$variable[[i]]
+    if (!nm %in% names(out)) next
+    typ <- var_types$type[[i]]
+    if (typ == "binary") {
+      out[[nm]] <- as.integer(out[[nm]])
+      out[[nm]] <- factor(out[[nm]], levels = sort(unique(out[[nm]])))
+    } else if (typ == "categorical") {
+      out[[nm]] <- factor(as.character(out[[nm]]))
+    } else if (typ == "ordinal") {
+      # ordered factor on sorted unique numeric/character levels
+      vals <- out[[nm]]
+      if (is.numeric(vals) || is.integer(vals)) {
+        lev <- sort(unique(as.numeric(vals)))
+        out[[nm]] <- factor(as.numeric(vals), levels = lev, ordered = TRUE)
+      } else {
+        lev <- sort(unique(as.character(vals)))
+        out[[nm]] <- factor(as.character(vals), levels = lev, ordered = TRUE)
+      }
+    } else {
+      out[[nm]] <- as.numeric(out[[nm]])
+    }
+  }
+  out
+}
+
+#' Prepare Y, D, X from a real-schema BBB table.
 #'
-#' Returns a data.frame of raw mixed types plus encoded matrices and truth.
-make_mixed_dml_data <- function(n = 2000L, theta = 1.5) {
-  # --- Continuous numeric ---
-  opp_strength <- rnorm(n, 0, 1)          # standardised opposition strength
-  over_frac <- runif(n, 0, 1)             # progress through innings
-  ball_speed <- rnorm(n, 135, 8)          # km/h-ish
+#' @param dt data.table/data.frame with RAW_BBB_COLUMNS
+#' @param treatment_col binary treatment column name
+#' @param true_theta known θ when data were simulated; NULL for real data
+prepare_dml_from_bbb <- function(dt, treatment_col = "batter_is_home", true_theta = NULL) {
+  dt <- data.table::as.data.table(dt)
+  validate_raw_schema(dt)
 
-  # --- Binary ---
-  is_home <- rbinom(n, 1L, 0.55)
-  day_night <- rbinom(n, 1L, 0.65)
+  if (!treatment_col %in% names(dt)) {
+    stop("Treatment column not found: ", treatment_col, call. = FALSE)
+  }
 
-  # --- Unordered categorical ---
-  venue <- sample(c("Coastal", "Capital", "Highland", "Desert"), n, replace = TRUE,
-                  prob = c(0.35, 0.30, 0.20, 0.15))
-  phase <- sample(c("powerplay", "middle", "death"), n, replace = TRUE,
-                  prob = c(0.30, 0.45, 0.25))
-  bowler_hand <- sample(c("left", "right"), n, replace = TRUE, prob = c(0.28, 0.72))
+  # Keep legal deliveries with observed score / treatment
+  dt <- dt[!is.na(bat_score) & !is.na(get(treatment_col))]
+  if ("legal_ball" %in% names(dt)) {
+    dt <- dt[legal_ball == 1 | is.na(legal_ball)]
+  }
 
-  # --- Ordinal ---
-  # batting position 1 (opener) ... 7 (lower); treat as ordered
-  batting_position <- sample(1:7, n, replace = TRUE, prob = c(0.18, 0.16, 0.16, 0.14, 0.14, 0.12, 0.10))
-  # pitch quality rating 1 (poor) ... 5 (excellent)
-  pitch_rating <- sample(1:5, n, replace = TRUE, prob = c(0.10, 0.20, 0.35, 0.25, 0.10))
+  Y <- as.numeric(dt$bat_score)
+  D <- as.numeric(dt[[treatment_col]])
+  # coerce logical / factor treatment to 0/1
+  if (is.logical(dt[[treatment_col]])) {
+    D <- as.numeric(dt[[treatment_col]])
+  } else if (is.factor(dt[[treatment_col]])) {
+    D <- as.numeric(dt[[treatment_col]]) - 1
+  }
+  if (!all(D %in% c(0, 1))) {
+    # allow 0/1 numeric already; otherwise binarize by != 0
+    D <- as.numeric(D != 0)
+  }
 
-  raw <- data.frame(
-    opp_strength = opp_strength,
-    over_frac = over_frac,
-    ball_speed = ball_speed,
-    is_home = factor(is_home, levels = c(0, 1), labels = c("away", "home")),
-    day_night = factor(day_night, levels = c(0, 1), labels = c("day", "night")),
-    venue = factor(venue, levels = c("Coastal", "Capital", "Highland", "Desert")),
-    phase = factor(phase, levels = c("powerplay", "middle", "death")),
-    bowler_hand = factor(bowler_hand, levels = c("left", "right")),
-    batting_position = factor(batting_position, levels = 1:7, ordered = TRUE),
-    pitch_rating = factor(pitch_rating, levels = 1:5, ordered = TRUE),
-    stringsAsFactors = FALSE
-  )
+  # Controls: typed columns except treatment, exclusions
+  ctrl_vars <- CONTROL_VAR_TYPES$variable
+  ctrl_vars <- setdiff(ctrl_vars, c(treatment_col, EXCLUDE_FROM_X))
+  ctrl_vars <- intersect(ctrl_vars, names(dt))
+  var_types <- CONTROL_VAR_TYPES[CONTROL_VAR_TYPES$variable %in% ctrl_vars, , drop = FALSE]
 
-  # Variable-type dictionary for documentation / checks
-  var_types <- data.frame(
-    variable = c(
-      "opp_strength", "over_frac", "ball_speed",
-      "is_home", "day_night",
-      "venue", "phase", "bowler_hand",
-      "batting_position", "pitch_rating"
-    ),
-    type = c(
-      "numeric", "numeric", "numeric",
-      "binary", "binary",
-      "categorical", "categorical", "categorical",
-      "ordinal", "ordinal"
-    ),
-    stringsAsFactors = FALSE
-  )
+  raw_x <- coerce_control_types(dt[, ..ctrl_vars], var_types)
+  # convert to data.frame for encode_mixed_features
+  raw_x <- as.data.frame(raw_x)
 
-  enc <- encode_mixed_features(raw)
-
-  # Nonlinear confounding g(X) used in both propensity and outcome
-  g <- 0.35 * enc$X_scaled[, "opp_strength"] +
-    0.25 * sin(2 * pi * enc$X_scaled[, "over_frac"]) -
-    0.15 * enc$X_scaled[, "ball_speed"] +
-    0.20 * (raw$is_home == "home") +
-    0.10 * (raw$phase == "death") -
-    0.12 * (raw$venue == "Desert") +
-    0.08 * as.numeric(raw$batting_position) / 7 +
-    0.05 * as.numeric(raw$pitch_rating) / 5 +
-    0.15 * enc$X_scaled[, "opp_strength"] * (raw$phase == "death")
-
-  # Treatment propensity depends on X (selection into "aggressive intent" / matchup)
-  e <- plogis(-0.2 + 0.6 * g + 0.3 * (raw$bowler_hand == "left"))
-  D <- rbinom(n, 1L, e)
-
-  # Outcome: partially linear — θ is the causal effect of D
-  Y <- theta * D + g + rnorm(n, 0, 0.75)
+  enc <- encode_mixed_features(raw_x)
 
   list(
-    raw = raw,
-    X = enc$X,                 # model matrix (numeric columns, dummies, ordinal codes)
+    raw = dt,
+    X = enc$X,
     X_scaled = enc$X_scaled,
     feature_info = enc$feature_info,
     var_types = var_types,
     D = as.numeric(D),
     Y = as.numeric(Y),
-    true_theta = theta,
-    true_propensity = e,
-    n = n
+    treatment_col = treatment_col,
+    outcome_col = "bat_score",
+    true_theta = true_theta,
+    n = nrow(dt),
+    match_id = as.character(dt$match_id)
   )
 }
 
+# =============================================================================
+# Mixed-type encoder
+# =============================================================================
+
 #' Encode mixed-type data.frame -> numeric design matrix.
-#'
-#' - numeric: left as-is then column-scaled for the net
-#' - binary / categorical: treatment contrasts (drop first level)
-#' - ordinal: integer codes 1..L (monotonic numeric embedding)
 encode_mixed_features <- function(df) {
   stopifnot(is.data.frame(df))
   pieces <- list()
@@ -175,21 +395,28 @@ encode_mixed_features <- function(df) {
   for (nm in names(df)) {
     v <- df[[nm]]
     if (is.ordered(v)) {
-      # Ordinal: integer score in [1, L]
       code <- as.numeric(v)
       mat <- matrix(code, ncol = 1L, dimnames = list(NULL, nm))
       pieces[[nm]] <- mat
       info[[nm]] <- list(type = "ordinal", levels = levels(v), cols = nm)
     } else if (is.factor(v) || is.character(v)) {
       v <- factor(v)
-      # Unordered: full-rank dummy encoding without intercept column per factor
       mm <- stats::model.matrix(~ 0 + v)
       colnames(mm) <- paste0(nm, "=", gsub("^v", "", colnames(mm)))
-      # Drop first level for identification (reference)
       ref <- levels(v)[[1]]
       drop_col <- paste0(nm, "=", ref)
       keep <- setdiff(colnames(mm), drop_col)
+      if (!length(keep)) {
+        # single-level factor: skip
+        next
+      }
       mm <- mm[, keep, drop = FALSE]
+      # Cap ultra-high-cardinality categoricals (e.g. bowler_id) to top levels
+      if (ncol(mm) > 40L) {
+        freqs <- colSums(mm)
+        keep_top <- names(sort(freqs, decreasing = TRUE))[seq_len(40L)]
+        mm <- mm[, keep_top, drop = FALSE]
+      }
       pieces[[nm]] <- mm
       info[[nm]] <- list(type = "categorical", levels = levels(v), reference = ref, cols = colnames(mm))
     } else {
@@ -200,20 +427,13 @@ encode_mixed_features <- function(df) {
   }
 
   X <- do.call(cbind, pieces)
-  # Column-scale for neural nets (preserve column names)
   mu <- colMeans(X)
   sds <- apply(X, 2L, stats::sd)
   sds[!is.finite(sds) | sds < 1e-8] <- 1
   X_scaled <- sweep(sweep(X, 2L, mu, "-"), 2L, sds, "/")
   colnames(X_scaled) <- colnames(X)
 
-  list(
-    X = X,
-    X_scaled = X_scaled,
-    feature_info = info,
-    center = mu,
-    scale = sds
-  )
+  list(X = X, X_scaled = X_scaled, feature_info = info, center = mu, scale = sds)
 }
 
 # =============================================================================
@@ -251,13 +471,9 @@ batch_iterator <- function(x, y, batch_size, device, shuffle = TRUE) {
 }
 
 train_regressor <- function(
-    x_train,
-    y_train,
-    epochs = 20L,
-    batch_size = 128L,
-    lr = 1e-3,
-    device,
-    verbose = FALSE
+    x_train, y_train,
+    epochs = 20L, batch_size = 128L, lr = 1e-3,
+    device, verbose = FALSE
 ) {
   model <- build_regressor(ncol(x_train))
   model$to(device = device)
@@ -297,21 +513,13 @@ predict_regressor <- function(model, x_new, device) {
 }
 
 # =============================================================================
-# Cross-fitted Double ML (partially linear ATE)
+# Cross-fitted Double ML
 # =============================================================================
 
-#' Cross-fitted DML for binary treatment with neural nuisances on `device`.
 estimate_dml_ate <- function(
-    X,
-    D,
-    Y,
-    n_folds = 5L,
-    epochs = 20L,
-    batch_size = 128L,
-    lr = 1e-3,
-    device,
-    seed = 123L,
-    verbose = TRUE
+    X, D, Y,
+    n_folds = 5L, epochs = 20L, batch_size = 128L, lr = 1e-3,
+    device, seed = 123L, cluster = NULL, verbose = TRUE
 ) {
   n <- nrow(X)
   set.seed(seed)
@@ -337,40 +545,47 @@ estimate_dml_ate <- function(
 
     if (verbose) cat("Fitting E[Y | X] ...\n")
     m_y <- train_regressor(
-      x_train = X[train, , drop = FALSE],
-      y_train = Y[train],
-      epochs = epochs,
-      batch_size = batch_size,
-      lr = lr,
-      device = device,
-      verbose = verbose
+      X[train, , drop = FALSE], Y[train],
+      epochs = epochs, batch_size = batch_size, lr = lr,
+      device = device, verbose = verbose
     )
     y_hat[test] <- predict_regressor(m_y, X[test, , drop = FALSE], device)
 
     if (verbose) cat("Fitting E[D | X] ...\n")
     m_d <- train_regressor(
-      x_train = X[train, , drop = FALSE],
-      y_train = D[train],
-      epochs = epochs,
-      batch_size = batch_size,
-      lr = lr,
-      device = device,
-      verbose = verbose
+      X[train, , drop = FALSE], D[train],
+      epochs = epochs, batch_size = batch_size, lr = lr,
+      device = device, verbose = verbose
     )
     d_hat[test] <- predict_regressor(m_d, X[test, , drop = FALSE], device)
   }
 
-  # Residual-on-residual OLS (ATE)
   y_resid <- Y - y_hat
   d_resid <- D - d_hat
-  theta_hat <- sum(d_resid * y_resid) / sum(d_resid^2)
+  denom <- sum(d_resid^2)
+  if (denom < 1e-12) stop("Degenerate D residuals; check treatment variation.", call. = FALSE)
+  theta_hat <- sum(d_resid * y_resid) / denom
   u <- y_resid - theta_hat * d_resid
 
-  # HC1-style robust SE
-  n_eff <- n
-  meat <- mean((d_resid^2) * (u^2))
-  bread <- mean(d_resid^2)
-  se <- sqrt(meat / (n_eff * bread^2))
+  # Match-clustered sandwich SE when cluster provided
+  if (is.null(cluster)) {
+    meat <- mean((d_resid^2) * (u^2))
+    bread <- mean(d_resid^2)
+    se <- sqrt(meat / (n * bread^2))
+    n_clusters <- n
+  } else {
+    cluster <- as.character(cluster)
+    score_sum <- 0
+    bread <- sum(d_resid^2) / n
+    for (cl in unique(cluster)) {
+      ix <- which(cluster == cl)
+      sc <- sum(d_resid[ix] * u[ix])
+      score_sum <- score_sum + sc^2
+    }
+    n_clusters <- length(unique(cluster))
+    meat <- score_sum / n_clusters
+    se <- sqrt(meat / (n_clusters * bread^2))
+  }
   ci <- theta_hat + c(-1.96, 1.96) * se
 
   list(
@@ -387,6 +602,7 @@ estimate_dml_ate <- function(
       n = n,
       p = ncol(X),
       n_folds = n_folds,
+      n_clusters = n_clusters,
       device = device$type,
       mean_abs_y_resid = mean(abs(y_resid)),
       mean_abs_d_resid = mean(abs(d_resid)),
@@ -400,22 +616,39 @@ estimate_dml_ate <- function(
 # =============================================================================
 
 cat("============================================================\n")
-cat("Double ML with mixed-type covariates (GPU neural nuisances)\n")
+cat("Double ML on real BBB schema (mixed types, GPU nuisances)\n")
 cat("============================================================\n")
+cat("Schema columns:\n")
+cat(paste(" -", RAW_BBB_COLUMNS), sep = "\n")
+cat("\n")
 
-dat <- make_mixed_dml_data(n = n_obs, theta = true_theta)
+if (nzchar(data_path)) {
+  cat("Loading real data:", data_path, "\n")
+  bbb <- load_real_schema_bbb(data_path)
+  dat <- prepare_dml_from_bbb(bbb, treatment_col = treatment_col, true_theta = NULL)
+} else {
+  cat(sprintf("No --data given; simulating n=%d rows in real schema (θ=%.3f)\n",
+              n_obs, true_theta))
+  bbb <- simulate_real_schema_bbb(n = n_obs, theta = true_theta)
+  dat <- prepare_dml_from_bbb(bbb, treatment_col = treatment_col, true_theta = true_theta)
+}
 
-cat("\nVariable types in X:\n")
+cat(sprintf("\nOutcome Y: %s | Treatment D: %s\n", dat$outcome_col, dat$treatment_col))
+cat("\nControl variable types in X:\n")
 print(dat$var_types, row.names = FALSE)
 
 cat(sprintf(
   "\nEncoded design: n=%d | p=%d columns after expanding categoricals/ordinals\n",
   dat$n, ncol(dat$X_scaled)
 ))
-cat("Feature columns:\n")
-cat(paste(" -", colnames(dat$X_scaled)), sep = "\n")
-cat(sprintf("\nTrue θ = %.4f | mean(D)=%.3f | mean(Y)=%.3f\n",
-            dat$true_theta, mean(dat$D), mean(dat$Y)))
+cat("Feature columns (first 30):\n")
+show_cols <- colnames(dat$X_scaled)
+if (length(show_cols) > 30L) show_cols <- c(utils::head(show_cols, 30L), "...")
+cat(paste(" -", show_cols), sep = "\n")
+cat(sprintf("\nmean(D)=%.3f | mean(Y)=%.3f\n", mean(dat$D), mean(dat$Y)))
+if (!is.null(dat$true_theta)) {
+  cat(sprintf("True θ (simulation only): %.4f\n", dat$true_theta))
+}
 
 fit <- estimate_dml_ate(
   X = dat$X_scaled,
@@ -427,6 +660,7 @@ fit <- estimate_dml_ate(
   lr = lr,
   device = device,
   seed = seed,
+  cluster = dat$match_id,
   verbose = TRUE
 )
 
@@ -435,20 +669,28 @@ cat("DML results\n")
 cat("============================================================\n")
 cat(sprintf("Device:              %s\n", fit$diagnostics$device))
 cat(sprintf("Folds:               %d\n", fit$diagnostics$n_folds))
-cat(sprintf("True θ:              %.4f\n", dat$true_theta))
+cat(sprintf("Clusters (matches):  %d\n", fit$diagnostics$n_clusters))
+cat(sprintf("Treatment:           %s\n", dat$treatment_col))
+cat(sprintf("Outcome:             %s\n", dat$outcome_col))
+if (!is.null(dat$true_theta)) {
+  cat(sprintf("True θ:              %.4f\n", dat$true_theta))
+}
 cat(sprintf("DML θ̂:              %.4f\n", fit$theta))
-cat(sprintf("Robust SE:           %.4f\n", fit$se))
+cat(sprintf("Cluster-robust SE:   %.4f\n", fit$se))
 cat(sprintf("95%% CI:              [%.4f, %.4f]\n", fit$ci_lo, fit$ci_hi))
-cat(sprintf("Error θ̂ − θ:         %.4f\n", fit$theta - dat$true_theta))
+if (!is.null(dat$true_theta)) {
+  cat(sprintf("Error θ̂ − θ:         %.4f\n", fit$theta - dat$true_theta))
+}
 cat(sprintf("Mean |Y residual|:   %.4f\n", fit$diagnostics$mean_abs_y_resid))
 cat(sprintf("Mean |D residual|:   %.4f\n", fit$diagnostics$mean_abs_d_resid))
 cat(sprintf("Corr(D, D̂):          %.4f\n", fit$diagnostics$corr_d_dhat))
 
-# Naive OLS of Y on D only (confounded) for contrast
 naive <- stats::lm(dat$Y ~ dat$D)
-naive_theta <- unname(stats::coef(naive)[["dat$D"]])
-cat(sprintf("\nNaive OLS θ (confounded): %.4f | |bias|=%.4f\n",
-            naive_theta, abs(naive_theta - dat$true_theta)))
-cat(sprintf("DML |bias|:                 %.4f\n", abs(fit$theta - dat$true_theta)))
+naive_theta <- unname(stats::coef(naive)[[2]])
+cat(sprintf("\nNaive OLS θ (confounded): %.4f\n", naive_theta))
+if (!is.null(dat$true_theta)) {
+  cat(sprintf("Naive |bias|:               %.4f\n", abs(naive_theta - dat$true_theta)))
+  cat(sprintf("DML |bias|:                 %.4f\n", abs(fit$theta - dat$true_theta)))
+}
 
-invisible(list(data = dat, fit = fit, naive_theta = naive_theta))
+invisible(list(data = dat, fit = fit, naive_theta = naive_theta, schema = RAW_BBB_COLUMNS))
