@@ -399,7 +399,7 @@ encode_mixed_features <- function(df) {
       mat <- matrix(code, ncol = 1L, dimnames = list(NULL, nm))
       pieces[[nm]] <- mat
       info[[nm]] <- list(type = "ordinal", levels = levels(v), cols = nm)
-    } else if (is.factor(v) || is.character(v)) {
+    } else if ((is.factor(v) && length(levels(v)) != 1) || is.character(v)) {
       v <- factor(v)
       mm <- stats::model.matrix(~ 0 + v)
       colnames(mm) <- paste0(nm, "=", gsub("^v", "", colnames(mm)))
