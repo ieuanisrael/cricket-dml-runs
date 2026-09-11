@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import doubleml as dml  # noqa: E402
 
-from cricket_dml.frame import (  # noqa: E402
+from cricket_dml import (  # noqa: E402
     AnalysisFrame,
     build_frame,
     load_deliveries,
